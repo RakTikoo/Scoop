@@ -49,10 +49,6 @@ function known_buckets {
     known_bucket_repos | ForEach-Object { $_.PSObject.Properties | Select-Object -Expand 'name' }
 }
 
-function apps_in_bucket($dir) {
-    return (Get-ChildItem $dir -Filter '*.json' -Recurse).BaseName
-}
-
 function Get-LocalBucket {
     <#
     .SYNOPSIS

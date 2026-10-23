@@ -571,7 +571,23 @@ function app_status($app, $global) {
         $scanned, $null = Find-AppBucket $app
         if ($scanned) { $latest_manifest = $scanned }
     }
-    $status.removed = (!$manifest)
+    $status.renamed = $null
+    $alias_broken = $false
+    if (!$manifest -and $install_info.bucket) {
+        $alias = Find-AppAlias $app $install_info.bucket
+        if ($alias -and $alias.Ambiguous) {
+            # The alias is broken: the app is not gone, the error said what is wrong.
+            $alias_broken = $true
+        } elseif ($alias) {
+            $status.renamed = if ($alias.MissingBucket -or $alias.Bucket -ine $install_info.bucket) { "$($alias.Bucket)/$($alias.App)" } else { $alias.App }
+            if ($alias.MissingBucket) {
+                $status.latest_version = $null
+            } else {
+                $manifest = $latest_manifest = $alias.Manifest
+            }
+        }
+    }
+    $status.removed = (!$manifest -and !$status.renamed -and !$alias_broken)
     if ($latest_manifest.version) {
         $status.latest_version = $latest_manifest.version
     }
@@ -591,7 +607,11 @@ function app_status($app, $global) {
             return $null
         } else {
             $app, $bucket, $null = parse_app $_
-            return !(installed $app)
+            if (installed $app) { return $false }
+            $scanned, $null = Find-AppBucket $app
+            if ($scanned) { return $true }
+            $alias = Find-AppAlias $app
+            return !($alias -and !$alias.Ambiguous -and !$alias.MissingBucket -and (installed $alias.App))
         }
     }
     if ($deps) {

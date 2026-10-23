@@ -1,5 +1,5 @@
 function manifest_path($app, $bucket) {
-    (Get-ChildItem (Find-BucketDirectory $bucket) -Filter "$(sanitary_path $app).json" -Recurse).FullName
+    (Get-BucketManifestFiles $bucket "$(sanitary_path $app).json").FullName
 }
 
 function parse_json($path) {
@@ -32,7 +32,8 @@ function url_manifest($url) {
 }
 
 function Get-Manifest($app) {
-    $bucket, $manifest, $url = $null
+    $bucket, $manifest, $url, $deprecated_dir = $null
+    $allow_alias = $true
     $app = $app.TrimStart('/')
     # check if app is a URL or UNC path
     if ($app -match '^(ht|f)tps?://|\\\\') {
@@ -69,32 +70,117 @@ function Get-Manifest($app) {
                     $manifest = manifest $app $bucket
                     if (!$manifest) {
                         $deprecated_dir = (Find-BucketDirectory -Name $bucket -Root) + '\deprecated'
-                        $manifest = parse_json (Get-ChildItem $deprecated_dir -Filter "$(sanitary_path $app).json" -Recurse -ErrorAction Ignore).FullName
                     }
                 }
             }
+            # Without a recorded bucket the app must not be redirected at all.
+            $allow_alias = [bool]$bucket
         } else {
             $app, $bucket, $version = parse_app $app
             if ($bucket) {
                 $manifest = manifest $app $bucket
             } else {
                 $manifest, $bucket = Find-AppBucket $app
-                if (!$manifest) {
-                    # couldn't find app in buckets: check if it's a local path
-                    if (Test-Path $app) {
-                        $url = Convert-Path $app
-                        $app = appname_from_url $url
-                        $manifest = parse_json $url
-                    } else {
-                        if (($app -match '\\/') -or $app.EndsWith('.json')) { $url = $app }
-                        $app = appname_from_url $app
-                    }
+            }
+
+            if (!$manifest -and !$bucket) {
+                if (Test-Path $app) {
+                    $url = Convert-Path $app
+                    $app = appname_from_url $url
+                    $manifest = parse_json $url
+                } else {
+                    if (($app -match '\\/') -or $app.EndsWith('.json')) { $url = $app }
+                    $app = appname_from_url $app
                 }
             }
+        }
+
+        if ($allow_alias -and !$manifest -and !$url) {
+            $alias = Find-AppAlias $app $bucket
+            if ($alias -and $alias.Ambiguous) {
+                # Stop here: falling through would look the app up elsewhere.
+                return $app, $null, $bucket, $url
+            }
+            if ($alias) {
+                if ($alias.MissingBucket) {
+                    error "App '$app' was renamed to '$($alias.App)' in bucket '$($alias.Bucket)'. $(Get-BucketAddHint $alias.Bucket)"
+                    return $app, $null, $null, $url
+                }
+                $manifest = $alias.Manifest
+                $bucket = $alias.Bucket
+                $app = $alias.App
+            }
+        }
+        if (!$manifest -and $deprecated_dir) {
+            $manifest = parse_json (Get-ChildItem $deprecated_dir -Filter "$(sanitary_path $app).json" -Recurse -ErrorAction Ignore).FullName
         }
     }
 
     return $app, $manifest, $bucket, $url
+}
+
+function Get-BucketAddHint($bucket) {
+    $repo = known_bucket_repo $bucket
+    if ($repo) {
+        return "Add the bucket with 'scoop bucket add $bucket $repo', then retry."
+    }
+    return "Add the bucket with 'scoop bucket add $bucket <repo>', then retry."
+}
+
+function Get-BucketManifestFiles($bucket, $filter = '*.json') {
+    Get-ChildItem (Find-BucketDirectory $bucket) -Filter $filter -Recurse |
+        Where-Object { $_.Name -ne '.scoop-aliases.json' }
+}
+
+function Get-BucketAliasesPath($bucket) {
+    Join-Path (Find-BucketDirectory -Name $bucket -Root) '.scoop-aliases.json'
+}
+
+function Get-BucketMatchingAliases($bucket, $query) {
+    $alias_file = Get-BucketAliasesPath $bucket
+    if (!(Test-Path -LiteralPath $alias_file -PathType Leaf)) { return @() }
+    $aliases = parse_json $alias_file
+    if ($aliases -isnot [System.Management.Automation.PSCustomObject]) { return @() }
+    $aliases.PSObject.Properties |
+        Where-Object { $_.Name -match $query -and $_.Value -is [string] } |
+        ForEach-Object {
+            $app, $target_bucket, $null = parse_app $_.Value
+            if (!$target_bucket) { $target_bucket = $bucket }
+            [PSCustomObject]@{ Name = $_.Name; App = $app; Bucket = $target_bucket }
+        }
+}
+
+function Get-BucketAliasTarget($app, $bucket) {
+    $alias_file = Get-BucketAliasesPath $bucket
+    if (!(Test-Path -LiteralPath $alias_file -PathType Leaf)) { return $null }
+
+    $aliases = parse_json $alias_file
+    if ($null -eq $aliases) { return $null }
+
+    if ($aliases -isnot [System.Management.Automation.PSCustomObject]) {
+        warn "Bucket alias map at '$alias_file' must be a JSON object."
+        return $null
+    }
+
+    $entries = @($aliases.PSObject.Properties | Where-Object { $_.Name -ieq $app })
+    if ($entries.Count -eq 0) { return $null }
+
+    $target = $entries[0].Value
+    if ($target -isnot [string]) {
+        warn "Alias '$app' in '$alias_file' must point to a 'bucket/app' or 'app' string."
+        return $null
+    }
+
+    $target_app, $target_bucket, $target_version = parse_app $target
+    if (!$target_bucket) { $target_bucket = $bucket }
+    if ($target_version -or
+        $target_app -notmatch '^[a-zA-Z0-9-_.]+$' -or $target_app -in '.', '..' -or $target_app -match '\.json$' -or
+        $target_bucket -in '.', '..') {
+        warn "Alias '$app' in '$alias_file' has invalid target '$target'; expected 'bucket/app' or 'app'."
+        return $null
+    }
+
+    return "$target_bucket/$target_app"
 }
 
 function Find-AppBucket($app) {
@@ -110,6 +196,61 @@ function Find-AppBucket($app) {
         warn "Multiple buckets contain manifest '$app', the current selection is '$($matched_buckets[0])/$app'."
     }
     return $manifest, $matched_buckets[0]
+}
+
+function Find-AppAlias($app, $source) {
+    $local_buckets = @(Get-LocalBucket)
+    # Only the install source bucket may redirect; a fresh install may be claimed by any.
+    $search_buckets = if ($source) { @($source) } else { $local_buckets }
+
+    $alias_matches = @()
+    foreach ($alias_bucket in $search_buckets) {
+        $target = Get-BucketAliasTarget $app $alias_bucket
+        if (!$target) { continue }
+
+        $target_app, $target_bucket, $null = parse_app $target
+        $match = [pscustomobject]@{
+            Manifest      = $null
+            Bucket        = $target_bucket
+            App           = $target_app
+            Source        = $alias_bucket
+            MissingBucket = $true
+            Ambiguous     = $false
+        }
+        if ($target_bucket -notin $local_buckets) {
+            $alias_matches += $match
+            continue
+        }
+
+        $target_manifest = parse_json (manifest_path $target_app $target_bucket)
+        if (!$target_manifest) {
+            warn "Alias '$app' in bucket '$alias_bucket' points to missing manifest '$target'."
+            continue
+        }
+
+        $match.Manifest = $target_manifest
+        $match.MissingBucket = $false
+        $alias_matches += $match
+    }
+
+    if ($alias_matches.Count -eq 0) { return $null }
+
+    $resolvable = @($alias_matches | Where-Object { !$_.MissingBucket })
+    $chosen = if ($resolvable.Count -gt 0) { $resolvable } else { $alias_matches }
+
+    if (@($chosen | Group-Object { "$($_.Bucket)/$($_.App)" }).Count -gt 1) {
+        $sources = ($chosen.Source | Select-Object -Unique) -join ', '
+        error "Alias '$app' is defined in multiple buckets ($sources). Specify a bucket."
+        return [pscustomobject]@{
+            Manifest      = $null
+            Bucket        = $null
+            App           = $null
+            Source        = $null
+            MissingBucket = $true
+            Ambiguous     = $true
+        }
+    }
+    return $chosen[0]
 }
 
 function manifest($app, $bucket, $url) {

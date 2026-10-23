@@ -1,6 +1,7 @@
 BeforeAll {
     . "$PSScriptRoot\Scoop-TestLib.ps1"
     . "$PSScriptRoot\..\lib\core.ps1"
+    . "$PSScriptRoot\..\lib\buckets.ps1"
     . "$PSScriptRoot\..\lib\system.ps1"
     . "$PSScriptRoot\..\lib\manifest.ps1"
     . "$PSScriptRoot\..\lib\shortcuts.ps1"
@@ -11,6 +12,22 @@ BeforeAll {
     . "$PSScriptRoot\..\lib\download.ps1" # 'Invoke-ScoopDownload'
     . "$PSScriptRoot\..\lib\decompress.ps1" # 'Invoke-Extraction'
     . "$PSScriptRoot\..\lib\json.ps1" # 'ConvertToPrettyJson'
+}
+
+Describe 'move_app_cache' -Tag 'Scoop' {
+    It 'renames the cached downloads of the old name only' {
+        $cache = Join-Path $TestDrive ([guid]::NewGuid())
+        New-Item -ItemType Directory -Path $cache -Force | Out-Null
+        'zip' | Set-Content (Join-Path $cache 'foo#1.0.0#abc.zip')
+        'part' | Set-Content (Join-Path $cache 'foo#1.0.0#abc.zip.download')
+        'zip' | Set-Content (Join-Path $cache 'foo.bar#1.0.0#abc.zip')
+
+        move_app_cache 'foo' 'bar' $cache
+
+        (Get-ChildItem $cache).Name | Should-ContainCollection 'bar#1.0.0#abc.zip', 'bar#1.0.0#abc.zip.download'
+        (Get-ChildItem $cache).Name | Should-ContainCollection 'foo.bar#1.0.0#abc.zip'
+        (Get-ChildItem $cache).Name | Should-NotContainCollection 'foo#1.0.0#abc.zip'
+    }
 }
 
 Describe 'appname_from_url' -Tag 'Scoop' {
@@ -108,6 +125,17 @@ Describe 'install_app' -Tag 'Scoop' {
 
         $deps | Should-BeCollection -Count 1
         @($deps)[0] | Should-Be 'bar'
+    }
+
+    It 'should find the failure of a dependency listed under its old name' {
+        $manifest = [PSCustomObject]@{ depends = @('old-name') }
+        $failed = @{ 'new-name' = 'download failed' }
+        Mock Find-AppAlias { $null }
+        Mock Find-AppAlias {
+            [pscustomobject]@{ Manifest = @{}; Bucket = 'main'; App = 'new-name'; Source = 'main'; MissingBucket = $false; Ambiguous = $false }
+        } -ParameterFilter { $app -eq 'old-name' }
+
+        failed_deps $manifest $failed | Should-BeCollection @('new-name')
     }
 
     It 'should not ask for the manifest when the update flow installs a dependency' {

@@ -230,7 +230,12 @@ function remove_obsolete_wiring($ctx, $old_manifest, $new_manifest) {
     if ($shortcuts) { rm_startmenu_shortcuts @{ shortcuts = $shortcuts } $ctx.global $ctx.architecture }
 
     $current = "$(Split-Path $ctx.dir)\current"
-    $paths = @(env_paths $new_manifest $current $ctx.persist_dir $ctx.new_architecture)
+    # a renamed app keeps none of its paths: every one of them names the old folder
+    $paths = if ($ctx.renamed_to) {
+        @()
+    } else {
+        @(env_paths $new_manifest $current $ctx.persist_dir $ctx.new_architecture)
+    }
     # the old paths were expanded with the version directory, a nightly manifest keeps the name 'nightly'
     $version = Split-Path $ctx.dir -Leaf
     if (get_config NO_JUNCTION) {
@@ -257,6 +262,19 @@ function remove_obsolete_wiring($ctx, $old_manifest, $new_manifest) {
 }
 
 function restore_app($ctx, $old_manifest, $old_version, $backup) {
+    if ($ctx.renamed_to -and (Test-Path -LiteralPath (appdir $ctx.renamed_to $ctx.global))) {
+        $renamed_from = $ctx.renamed_to
+        $ctx.renamed_to = $null
+        try {
+            Move-Item -LiteralPath (appdir $renamed_from $ctx.global) -Destination (appdir $ctx.app $ctx.global) -ErrorAction Stop
+            if (Test-Path -LiteralPath (persistdir $renamed_from $ctx.global)) {
+                Move-Item -LiteralPath (persistdir $renamed_from $ctx.global) -Destination $ctx.persist_dir -ErrorAction Stop
+            }
+            move_app_cache $renamed_from $ctx.app
+        } catch {
+            warn "'$($ctx.app)' could not be moved back: $($_.Exception.Message)"
+        }
+    }
     # the old manifest expands $version, which still names the failed update
     $version = $old_version
     if ($backup -and (Test-Path $backup)) {
@@ -281,6 +299,13 @@ function restore_app($ctx, $old_manifest, $old_version, $backup) {
     } else {
         warn "'$($ctx.app)' ($old_version) cannot be restored; its files were removed by the uninstaller."
     }
+}
+
+function move_app_cache($app, $new_app, $dir = $cachedir) {
+    $pattern = '^' + [regex]::Escape($app) + '#'
+    Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match $pattern } |
+        ForEach-Object { Rename-Item -LiteralPath $_.FullName -NewName ($_.Name -replace $pattern, "$new_app#") }
 }
 
 function update_app($app, $global, $force = $false, $quiet = $false, $independent, $suggested, $failed, $use_cache = $true, $check_hash = $true) {
@@ -310,6 +335,41 @@ function update_app($app, $global, $force = $false, $quiet = $false, $independen
         if ($null -eq $bucket -and !$url) { $bucket = 'main' }
         $manifest = manifest $app $bucket $url
     }
+
+    # Take the new name only after the download succeeded, so a failure leaves the old app usable.
+    $migrated_from = $null
+    $renamed_to = $null
+    $moved_persist = $false
+    if (!$manifest -and $bucket) {
+        $alias = Find-AppAlias $app $bucket
+        if ($alias -and !$alias.Ambiguous) {
+            $target = "$($alias.Bucket)/$($alias.App)"
+            if ($alias.MissingBucket) {
+                $failed[$app_key] = "skipped: renamed to '$target'; $(Get-BucketAddHint $alias.Bucket)"
+                return
+            }
+            if ($alias.App -ne $app) {
+                $blocked = if (installed $alias.App $global) {
+                    "'$($alias.App)' is already installed"
+                } elseif (Test-Path -LiteralPath (appdir $alias.App $global)) {
+                    "'$(appdir $alias.App $global)' already exists"
+                } elseif (Test-Path -LiteralPath (persistdir $alias.App $global)) {
+                    "'$(persistdir $alias.App $global)' already holds saved data"
+                }
+                if ($blocked) {
+                    $failed[$app_key] = "skipped: renamed to '$target'; $blocked"
+                    return
+                }
+                $renamed_to = $alias.App
+            } else {
+                $migrated_from = $bucket
+            }
+            $bucket = $alias.Bucket
+            $manifest = $alias.Manifest
+            $url = $null
+        }
+    }
+
     $version = $manifest.version
     $is_nightly = $version -eq 'nightly'
     if ($is_nightly) {
@@ -317,7 +377,7 @@ function update_app($app, $global, $force = $false, $quiet = $false, $independen
         $check_hash = $false
     }
 
-    if (!$force -and ($old_version -eq $version)) {
+    if (!$force -and !$renamed_to -and ($old_version -eq $version)) {
         if (!$quiet) {
             warn "The latest version of '$app' ($version) is already installed."
         }
@@ -335,6 +395,9 @@ function update_app($app, $global, $force = $false, $quiet = $false, $independen
         return
     }
 
+    if ($migrated_from) {
+        Write-Host "Migrating '$app' from bucket '$migrated_from' to '$bucket'"
+    }
     Write-Host "Updating '$app' ($old_version -> $version)"
 
     # the new version may be built for another architecture than the installed one
@@ -354,7 +417,8 @@ function update_app($app, $global, $force = $false, $quiet = $false, $independen
     }
 
     # a version that is still installed is switched to here, the same way 'scoop reset' does
-    $forced = $force -and $old_version -eq $version
+    # a renamed app needs the same treatment as -f: its folder is replaced, not switched to
+    $forced = ($force -or $renamed_to) -and $old_version -eq $version
     $dir = versiondir $app $old_version $global
     $persist_dir = persistdir $app $global
     $ctx = [PSCustomObject]@{
@@ -364,11 +428,12 @@ function update_app($app, $global, $force = $false, $quiet = $false, $independen
         global           = $global
         architecture     = $architecture
         new_architecture = $new_architecture
+        renamed_to       = $renamed_to
     }
     $installed_dir = versiondir $app $version $global
     $retained = !(Test-Path -LiteralPath "$installed_dir\.scoop-extracted") -and
     ((Test-Path -LiteralPath "$installed_dir\scoop-manifest.json") -or (Test-Path -LiteralPath "$installed_dir\manifest.json"))
-    if (!$forced -and $retained) {
+    if (!$forced -and $retained -and !$renamed_to) {
         if (test_running_process $app $global) {
             Write-Host 'Running process detected, skip updating.'
             $failed[$app_key] = 'blocked: running process'
@@ -477,6 +542,28 @@ function update_app($app, $global, $force = $false, $quiet = $false, $independen
 
         Invoke-HookScript -HookType 'post_uninstall' -Manifest $old_manifest -Arch $architecture
 
+        if ($renamed_to) {
+            # Only the paths move: everything above was read while they still had the old names.
+            Write-Host "Migrating '$app_key' to '$target'"
+            $old_persist = persistdir $app $global
+            if (Test-Path -LiteralPath $old_persist) {
+                Move-Item -LiteralPath $old_persist -Destination (persistdir $renamed_to $global) -ErrorAction Stop
+                $moved_persist = $true
+            }
+            try {
+                Move-Item -LiteralPath (appdir $app $global) -Destination (appdir $renamed_to $global) -ErrorAction Stop
+            } catch {
+                # Nothing else moved yet, so the app stays restorable under its old name.
+                if ($moved_persist) { Move-Item -LiteralPath (persistdir $renamed_to $global) -Destination $old_persist -ErrorAction Stop }
+                throw
+            }
+            move_app_cache $app $renamed_to
+            $prepared.dir = Join-Path (appdir $renamed_to $global) (Split-Path $prepared.dir -Leaf)
+            $app = $app_name = $renamed_to
+            $app_key = if ($global) { "$app (global)" } else { $app }
+            $dir = versiondir $app $old_version $global
+        }
+
         if ($bucket) {
             # add bucket name it was installed from
             $app = "$bucket/$app"
@@ -502,6 +589,14 @@ function update_app($app, $global, $force = $false, $quiet = $false, $independen
                 $prepared.dir = $dir
             }
             install_version $app_name $manifest $version $new_architecture $global $bucket $url $suggested $failed $prepared.dir $prepared.fname
+            if ($renamed_to) {
+                # the install set the shims of the old name aside, and they name the folder that moved
+                $shim_dir = shimdir $global
+                @(arch_specific 'bin' $old_manifest $architecture) | Where-Object { $_ } | ForEach-Object {
+                    $target, $name, $null = Get-ShimDefinition $_
+                    if (Test-Path -LiteralPath "$shim_dir\$name.shim.$($ctx.app)" -PathType Leaf) { Remove-Shim $name $shim_dir $ctx.app }
+                }
+            }
         }
         if ($failed.ContainsKey($app_key)) {
             restore_app $ctx $old_manifest $old_version $backup

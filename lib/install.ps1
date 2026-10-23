@@ -6,9 +6,18 @@ function nightly_version($quiet = $false) {
 }
 
 function failed_deps($manifest, $failed) {
-    @($manifest.depends | Where-Object { $_ } | ForEach-Object { (parse_app $_)[0] } | Where-Object {
-            ($failed[$_] -and $failed[$_] -notmatch '^(skipped|blocked): ') -or
-            ($failed["$_ (global)"] -and $failed["$_ (global)"] -notmatch '^(skipped|blocked): ')
+    @(foreach ($spec in @($manifest.depends | Where-Object { $_ })) {
+            $dep, $dep_bucket, $null = parse_app $spec
+            $names = @($dep)
+            $alias = Find-AppAlias $dep $dep_bucket
+            if ($alias -and !$alias.Ambiguous -and !$alias.MissingBucket) { $names += $alias.App }
+            foreach ($name in $names) {
+                if (($failed[$name] -and $failed[$name] -notmatch '^(skipped|blocked): ') -or
+                    ($failed["$name (global)"] -and $failed["$name (global)"] -notmatch '^(skipped|blocked): ')) {
+                    $name
+                    break
+                }
+            }
         })
 }
 

@@ -588,3 +588,87 @@ Describe 'abort' -Tag 'Scoop' {
         $code | Should-Be 7
     }
 }
+
+Describe 'app_status of a renamed app' -Tag 'Scoop' {
+    BeforeAll {
+        # Loaded here so that the describes above keep their own lazy dot-source behavior.
+        . "$PSScriptRoot\..\lib\versions.ps1"
+        . "$PSScriptRoot\..\lib\manifest.ps1"
+        . "$PSScriptRoot\..\lib\buckets.ps1"
+
+        # The shape Find-AppAlias returns; without a version its target bucket is missing.
+        function New-AliasStub([string] $app, [string] $bucket, [string] $source, [string] $version, [switch] $Ambiguous) {
+            $manifest = $null
+            if ($version) { $manifest = [pscustomobject]@{ version = $version } }
+            [pscustomobject]@{
+                Manifest      = $manifest
+                Bucket        = $bucket
+                App           = $app
+                Source        = $source
+                MissingBucket = !$version
+                Ambiguous     = [bool]$Ambiguous
+            }
+        }
+    }
+
+    BeforeEach {
+        Mock installed { $true }
+        Mock failed { $false }
+        Mock Select-CurrentVersion { '1.0.0' }
+        Mock install_info { [pscustomobject]@{ bucket = 'main'; url = $null; hold = $false } }
+        Mock get_config { $null }
+        Mock Find-BucketDirectory { Join-Path $TestDrive 'no-such-bucket' }
+        Mock manifest { $null }
+    }
+
+    It 'reports the app as renamed instead of removed' {
+        Mock Find-AppAlias { New-AliasStub 'new-name' 'main' 'main' '2.0.0' }
+
+        $status = app_status 'old-name' $false
+
+        Should-Invoke -CommandName Find-AppAlias -Times 1 -Exactly -ParameterFilter { $app -eq 'old-name' -and $source -eq 'main' }
+        $status.removed | Should-BeFalse
+        $status.renamed | Should-Be 'new-name'
+        $status.latest_version | Should-Be '2.0.0'
+        $status.outdated | Should-BeTrue
+    }
+
+    It 'reports the app as renamed when the target bucket is not installed' {
+        Mock Find-AppAlias { New-AliasStub 'new-name' 'versions' 'main' $null }
+
+        $status = app_status 'old-name' $false
+
+        $status.removed | Should-BeFalse
+        $status.renamed | Should-Be 'versions/new-name'
+        $status.latest_version | Should-BeNull
+        $status.outdated | Should-BeFalse
+    }
+
+    It 'does not report a broken alias as a removed app' {
+        Mock Find-AppAlias { New-AliasStub -Ambiguous }
+
+        $status = app_status 'old-name' $false
+
+        $status.renamed | Should-BeNull
+        $status.removed | Should-BeFalse
+    }
+
+    It 'reports the app as removed when no alias exists' {
+        Mock Find-AppAlias { $null }
+
+        $status = app_status 'old-name' $false
+
+        $status.removed | Should-BeTrue
+        $status.renamed | Should-BeNull
+    }
+
+    It 'does not look for an alias when the app was not installed from a bucket' {
+        Mock install_info { [pscustomobject]@{ bucket = $null; url = 'https://example.com/app.json'; hold = $false } }
+        Mock Find-AppAlias { $null }
+
+        $status = app_status 'old-name' $false
+
+        $status.removed | Should-BeTrue
+        Should-Invoke -CommandName Find-AppAlias -Times 0 -Exactly
+    }
+}

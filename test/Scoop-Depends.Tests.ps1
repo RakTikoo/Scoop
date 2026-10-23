@@ -64,6 +64,7 @@ Describe 'Package Dependencies' -Tag 'Scoop' {
     Context 'Dependencies resolution' {
         BeforeAll {
             Mock Test-HelperInstalled { $false }
+            Mock abort { throw "aborted: $msg" }
             Mock get_config { $true } -ParameterFilter { $name -eq 'USE_LESSMSI' }
             Mock get_config { $false } -ParameterFilter { $name -eq 'USE_EXTERNAL_7ZIP' }
             Mock Get-Manifest { 'lessmsi', @{}, $null, $null } -ParameterFilter { $app -eq 'lessmsi' }
@@ -100,6 +101,14 @@ Describe 'Package Dependencies' -Tag 'Scoop' {
             $deps = Get-Dependency -AppName 'bucket/test' -Architecture '32bit'
             $deps | Should-BeCollection -Count 2
             $deps | Should-ContainCollection @('anotherbucket/depends', 'bucket/test')
+        }
+        It 'Detects a cycle written as bucket/app' {
+            Mock Get-Manifest { 'self', @{ depends = 'main/self' }, 'main', $null }
+            { Get-Dependency -AppName 'main/self' -Architecture '32bit' } | Should-Throw -ExceptionMessage '*Circular dependency*'
+        }
+        It 'Detects a cycle that goes through an alias' {
+            Mock Get-Manifest { 'self', @{ depends = 'old-self' }, 'main', $null } -ParameterFilter { $app -eq 'old-self' }
+            { Get-Dependency -AppName 'old-self' -Architecture '32bit' } | Should-Throw -ExceptionMessage '*Circular dependency*'
         }
     }
 }

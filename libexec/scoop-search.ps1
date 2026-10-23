@@ -52,9 +52,21 @@ function bin_match_json($json, $query) {
     else { return $false }
 }
 
-function search_bucket($bucket, $query) {
-    $apps = Get-ChildItem (Find-BucketDirectory $bucket) -Filter '*.json' -Recurse
+function alias_search_results($bucket, $query) {
+    Get-BucketMatchingAliases $bucket $query | ForEach-Object {
+        $own = manifest_path $_.Name $bucket
+        if ($own -and (Test-Path -LiteralPath $own)) { return }
+        $path = manifest_path $_.App $_.Bucket
+        if (!$path -or !(Test-Path -LiteralPath $path)) { return }
+        $manifest = parse_json $path
+        if ($manifest) {
+            [PSCustomObject]@{ Name = $_.Name; Version = $manifest.version; Source = $bucket; Binaries = '' }
+        }
+    }
+}
 
+function search_bucket($bucket, $query) {
+    $apps = Get-BucketManifestFiles $bucket
     $apps | ForEach-Object {
         $filepath = $_.FullName
         $name = $_.BaseName
@@ -94,12 +106,13 @@ function search_bucket($bucket, $query) {
             }
         }
     }
+
+    alias_search_results $bucket $query | ForEach-Object { $list.Add($_) }
 }
 
 # fallback function for PowerShell 5
 function search_bucket_legacy($bucket, $query) {
-    $apps = Get-ChildItem (Find-BucketDirectory $bucket) -Filter '*.json' -Recurse
-
+    $apps = Get-BucketManifestFiles $bucket
     $apps | ForEach-Object {
         $filepath = $_.FullName
         $name = $_.BaseName
@@ -139,6 +152,8 @@ function search_bucket_legacy($bucket, $query) {
             }
         }
     }
+
+    alias_search_results $bucket $query | ForEach-Object { $list.Add($_) }
 }
 
 function search_remote($bucket, $query) {
@@ -192,6 +207,8 @@ if (get_config USE_SQLITE_CACHE) {
                     Binaries = $_.binary
                 })
         }
+    # The cache has no row for an alias name.
+    Get-LocalBucket | ForEach-Object { alias_search_results $_ ([regex]::Escape($query)) } | ForEach-Object { $list.Add($_) }
 } else {
     try {
         $query = New-Object Regex $query, 'IgnoreCase'

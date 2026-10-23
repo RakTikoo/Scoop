@@ -3,6 +3,7 @@ BeforeAll {
     . "$PSScriptRoot\..\lib\core.ps1"
     . "$PSScriptRoot\..\lib\manifest.ps1"
     . "$PSScriptRoot\..\lib\buckets.ps1"
+    . "$PSScriptRoot\..\lib\versions.ps1"
     . "$PSScriptRoot\..\lib\database.ps1"
     . "$PSScriptRoot\..\lib\autoupdate.ps1"
 }
@@ -335,5 +336,233 @@ Describe 'manifest bucket auto-discovery' -Tag 'Scoop' {
         $m = manifest 'foo' $null 'https://example.com/foo.json'
         $m.version | Should-Be '1.0.0'
         Should-Invoke url_manifest -Times 1
+    }
+}
+
+Describe 'manifest aliases' -Tag 'Scoop' {
+    BeforeAll {
+        Function Write-AliasMap([string] $bucket, [string] $app, [string] $target) {
+            $dir = Join-Path $aliasTestRoot $bucket
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $dir '.scoop-aliases.json'), ('{"' + $app + '":"' + $target + '"}'))
+        }
+
+        Function Write-AppManifest([string] $bucket, [string] $app, [string] $version) {
+            $dir = Join-Path $aliasTestRoot "$bucket\bucket"
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $dir "$app.json"), ('{"version":"' + $version + '"}'))
+        }
+    }
+
+    BeforeEach {
+        $aliasTestRoot = Join-Path $env:TEMP ("ScoopAliasTests_" + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $aliasTestRoot | Out-Null
+        Mock Get-LocalBucket { @('extras', 'main') }
+        Mock Find-BucketDirectory {
+            $repo = Join-Path $aliasTestRoot $Name
+            if ($Root -or !(Test-Path (Join-Path $repo 'bucket'))) {
+                $repo
+            } else {
+                Join-Path $repo 'bucket'
+            }
+        }
+        Mock warn {}
+        Mock error {}
+        Mock installed { $false }
+    }
+
+    AfterEach {
+        Remove-Item -Path $aliasTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'resolves alias names to the canonical manifest and bucket' {
+        Write-AppManifest 'main' 'new-name' '1.0.0'
+        [System.IO.File]::WriteAllText((Join-Path $aliasTestRoot 'main\.scoop-aliases.json'),
+            '{"old-name":"main/new-name","older-name":"main/new-name"}')
+
+        $app, $manifest, $bucket, $url = Get-Manifest 'old-name'
+
+        $app | Should-Be 'new-name'
+        $bucket | Should-Be 'main'
+        $manifest.version | Should-Be '1.0.0'
+        (Get-Manifest 'older-name')[0] | Should-Be 'new-name'
+    }
+
+    It 'prefers an exact manifest name over an alias' {
+        Write-AliasMap 'main' 'old-name' 'main/new-name'
+        Write-AppManifest 'main' 'new-name' '2.0.0'
+        Write-AppManifest 'extras' 'old-name' '1.0.0'
+
+        $app, $manifest, $bucket, $url = Get-Manifest 'old-name'
+
+        $app | Should-Be 'old-name'
+        $bucket | Should-Be 'extras'
+    }
+
+    It 'prefers the renamed app over the deprecated manifest of the old name' {
+        Write-AliasMap 'main' 'old-name' 'main/new-name'
+        Write-AppManifest 'main' 'new-name' '2.0.0'
+        $deprecatedDir = Join-Path $aliasTestRoot 'main\deprecated'
+        New-Item -ItemType Directory -Path $deprecatedDir -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $deprecatedDir 'old-name.json'), '{"version":"0.9.0"}')
+
+        $app, $manifest, $bucket, $url = Get-Manifest 'old-name'
+
+        $app | Should-Be 'new-name'
+        $manifest.version | Should-Be '2.0.0'
+    }
+
+    It 'prefers a local path over an alias' {
+        Write-AliasMap 'main' 'local-app' 'main/new-name'
+        Write-AppManifest 'main' 'new-name' '1.0.0'
+        [System.IO.File]::WriteAllText((Join-Path $aliasTestRoot 'local-app.json'), '{"version":"3.0.0"}')
+        Mock Find-AppAlias { $null }
+        Push-Location $aliasTestRoot
+        try {
+            $app, $manifest, $bucket, $url = Get-Manifest 'local-app.json'
+        } finally {
+            Pop-Location
+        }
+
+        Should-Invoke -CommandName Find-AppAlias -Times 0 -Exactly
+        $manifest.version | Should-Be '3.0.0'
+    }
+
+    It 'keeps the alias file out of the manifests of a flat bucket' {
+        Write-AliasMap 'main' 'old-name' 'main/new-name'
+        [System.IO.File]::WriteAllText((Join-Path $aliasTestRoot 'main\new-name.json'), '{"version":"1.0.0"}')
+
+        $names = @(Get-BucketManifestFiles 'main').Name
+
+        $names | Should-ContainCollection 'new-name.json'
+        $names | Should-NotContainCollection '.scoop-aliases.json'
+    }
+
+    It 'uses only the alias of the source bucket' {
+        Write-AliasMap 'extras' 'old-name' 'extras/new-name'
+        Write-AppManifest 'extras' 'new-name' '1.0.0'
+
+        Find-AppAlias 'old-name' 'main' | Should-BeNull
+        (Find-AppAlias 'old-name' $null).App | Should-Be 'new-name'
+    }
+
+    It 'reports an alias whose target bucket is not installed' {
+        Write-AliasMap 'main' 'old-name' 'versions/new-name'
+        Mock known_bucket_repo { 'https://github.com/ScoopInstaller/Versions' }
+        $script:errorMessage = $null
+        Mock error { $script:errorMessage = $msg }
+
+        $app, $manifest, $bucket, $url = Get-Manifest 'old-name'
+
+        $manifest | Should-BeNull
+        $script:errorMessage | Should-MatchString 'scoop bucket add versions'
+        $script:errorMessage | Should-MatchString "renamed to 'new-name'"
+    }
+
+    It 'reports an alias that points to different targets in several buckets' {
+        Write-AliasMap 'main' 'old-name' 'main/new-name'
+        Write-AliasMap 'extras' 'old-name' 'extras/other-name'
+        Write-AppManifest 'main' 'new-name' '1.0.0'
+        Write-AppManifest 'extras' 'other-name' '1.0.0'
+
+        $alias = Find-AppAlias 'old-name' $null
+
+        $alias.Ambiguous | Should-BeTrue
+        Should-Invoke -CommandName error -Times 1
+    }
+
+    Context 'installed app' {
+        BeforeEach {
+            Mock installed { $true }
+            Mock Select-CurrentVersion { '1.0.0' }
+            Mock installed_manifest { [pscustomobject]@{ version = '1.0.0' } }
+            Mock manifest { $null }
+        }
+
+        It 'resolves the alias of the bucket the app was installed from' {
+            Write-AliasMap 'extras' 'old-name' 'extras/new-name'
+            Write-AppManifest 'extras' 'new-name' '2.0.0'
+            Mock install_info { [pscustomobject]@{ bucket = 'extras'; url = $null } }
+
+            $app, $manifest, $bucket, $url = Get-Manifest 'old-name'
+
+            $app | Should-Be 'new-name'
+            $bucket | Should-Be 'extras'
+        }
+
+        It 'does not let another bucket redirect it' {
+            # 'main' points at a manifest that exists, so only the trust boundary
+            # keeps it from redirecting the app installed from 'extras'.
+            Write-AliasMap 'main' 'old-name' 'extras/new-name'
+            Write-AppManifest 'extras' 'new-name' '2.0.0'
+            Mock install_info { [pscustomobject]@{ bucket = 'extras'; url = $null } }
+
+            $app, $manifest, $bucket, $url = Get-Manifest 'old-name'
+
+            $app | Should-Be 'old-name'
+            $manifest | Should-BeNull
+        }
+
+        It 'does not redirect it when the source bucket is unknown' {
+            Write-AliasMap 'main' 'old-name' 'main/new-name'
+            Write-AppManifest 'main' 'new-name' '2.0.0'
+            Mock install_info { $null }
+
+            $app, $manifest, $bucket, $url = Get-Manifest 'old-name'
+
+            $app | Should-Be 'old-name'
+            $manifest | Should-BeNull
+        }
+    }
+
+    It 'resolves an alias that points to another installed bucket' {
+        Write-AliasMap 'main' 'old-name' 'extras/new-name'
+        Write-AppManifest 'extras' 'new-name' '2.0.0'
+
+        $app, $manifest, $bucket, $url = Get-Manifest 'old-name'
+
+        $app | Should-Be 'new-name'
+        $bucket | Should-Be 'extras'
+    }
+
+    Context 'alias target validation' {
+        BeforeEach {
+            $aliasDir = Join-Path $aliasTestRoot 'main'
+            New-Item -ItemType Directory -Path $aliasDir -Force | Out-Null
+        }
+
+        It 'accepts a bare app name as a target of the same bucket' {
+            [System.IO.File]::WriteAllText((Join-Path $aliasDir '.scoop-aliases.json'), '{"old-name":"new-name"}')
+
+            Get-BucketAliasTarget 'old-name' 'main' | Should-Be 'main/new-name'
+        }
+
+        It 'rejects an invalid target' {
+            $cases = @(
+                @{ target = 'main/'; why = 'the app part is empty' }
+                @{ target = '/name'; why = 'the bucket part is empty' }
+                @{ target = ' main/name'; why = 'it holds leading whitespace' }
+                @{ target = 'main/ name'; why = 'it holds whitespace after the separator' }
+                @{ target = 'main/new*name'; why = 'it holds a character that is invalid in a file name' }
+                @{ target = 'main/name.json'; why = 'it holds a .json suffix' }
+                @{ target = 'main/..'; why = 'it escapes the bucket' }
+            )
+            foreach ($case in $cases) {
+                [System.IO.File]::WriteAllText((Join-Path $aliasDir '.scoop-aliases.json'), ('{"old-name":"' + $case.target + '"}'))
+                Get-BucketAliasTarget 'old-name' 'main' | Should-BeNull -Because "the target is invalid: $($case.why)"
+            }
+        }
+
+        It 'rejects an unusable alias map' {
+            $cases = @(
+                @{ json = '{"old-name":{"app":"new-name"}}'; why = 'the target is not a string' }
+                @{ json = '["main/new-name"]'; why = 'the map is not a JSON object' }
+                @{ json = '{not json'; why = 'the map is not valid JSON' }
+            )
+            foreach ($case in $cases) {
+                [System.IO.File]::WriteAllText((Join-Path $aliasDir '.scoop-aliases.json'), $case.json)
+                Get-BucketAliasTarget 'old-name' 'main' | Should-BeNull -Because "the map is unusable: $($case.why)"
+            }
+        }
     }
 }
